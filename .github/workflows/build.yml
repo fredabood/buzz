@@ -1,0 +1,175 @@
+# Unofficial Buzz Android builds (LAB-1207)
+#
+# Every 6h: check block/buzz for a new mobile-v* tag; when one appears, build
+# a signed universal release APK from upstream source at that tag and publish
+# it as a GitHub Release for Obtainium consumption.
+#
+# Upstream ships NO production Android build — this workflow supplies the three
+# things their private pipeline provides: the release build command, version
+# injection (pubspec is permanently 0.0.0+1), and signing (via upstream's own
+# BUZZ_ANDROID_UPLOAD_* env contract; keystore must be absolute + outside the
+# repo checkout — gradle enforces both canonically).
+
+name: build
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream mobile tag to build (e.g. mobile-v0.10.0-rc.1); empty = latest'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Resolve latest upstream mobile tag vs our latest release
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_TAG" ]; then
+            latest="$REQUESTED_TAG"
+            echo "explicit tag requested: $latest"
+          else
+            # Poll TAGS — upstream publishes no mobile releases. Filter to the
+            # canonical shapes (one legacy lightweight tag exists) and sort by
+            # semver, rc-aware: plain X.Y.Z ranks above its own rcs (rc=99).
+            latest=$(gh api 'repos/block/buzz/git/matching-refs/tags/mobile-v' --paginate \
+              --jq '.[].ref | sub("refs/tags/"; "")' \
+              | grep -E '^mobile-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
+              | awk '{
+                  v=$0; sub(/^mobile-v/,"",v); rc=99
+                  if (match(v,/-rc\.[0-9]+$/)) { rc=substr(v,RSTART+4); sub(/-rc\.[0-9]+$/,"",v) }
+                  split(v,p,".")
+                  printf "%012d %s\n", p[1]*1000000+p[2]*10000+p[3]*100+rc, $0
+                }' | sort -n | tail -1 | cut -d' ' -f2)
+            echo "latest upstream tag: $latest"
+          fi
+          [ -n "$latest" ] || { echo "::error::no upstream mobile tag found"; exit 1; }
+          if gh release view "$latest" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $latest already exists — nothing to do"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$latest" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out block/buzz at ${{ needs.check.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: block/buzz
+          ref: ${{ needs.check.outputs.tag }}
+
+      - name: Cache hermit packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hermit/pkg
+          key: hermit-${{ hashFiles('./bin/*') }}
+
+      - name: Cache pub + gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+          key: pub-gradle-${{ hashFiles('mobile/pubspec.lock') }}
+
+      # Upstream's own toolchain pin (Flutter 3.41.7 et al. from ./bin) —
+      # min/target SDK float with the Flutter version, so this MUST mirror
+      # upstream rather than pinning Flutter independently.
+      - name: Activate Hermit
+        uses: cashapp/activate-hermit@v1
+
+      - name: Warm Flutter
+        run: flutter --version
+
+      - name: Restore signing keystore (outside the repo — gradle requires it)
+        env:
+          KEYSTORE_B64: ${{ secrets.BUZZ_UPLOAD_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/buzz-upload.jks"
+          [ -s "$RUNNER_TEMP/buzz-upload.jks" ] || { echo "::error::keystore decode produced empty file"; exit 1; }
+
+      - name: Build signed release APK
+        env:
+          BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH: ${{ runner.temp }}/buzz-upload.jks
+          BUZZ_ANDROID_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.BUZZ_UPLOAD_KEYSTORE_PASSWORD }}
+          BUZZ_ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.BUZZ_UPLOAD_KEY_ALIAS }}
+          BUZZ_ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.BUZZ_UPLOAD_KEY_PASSWORD }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # mobile-vX.Y.Z[-rc.N] -> build-name X.Y.Z, monotonic build-number
+          v="${TAG#mobile-v}"; rc=99
+          case "$v" in *-rc.*) rc="${v##*-rc.}"; v="${v%-rc.*}";; esac
+          IFS=. read -r maj min pat <<< "$v"
+          name="$v"
+          code=$(( maj*1000000 + min*10000 + pat*100 + rc ))
+          echo "versionName=$name versionCode=$code"
+          cd mobile
+          flutter pub get
+          flutter build apk --release --no-pub \
+            --build-name="$name" --build-number="$code" \
+            --dart-define=BUZZ_RELAY_URL=wss://buzz.dirtydata.studio
+          # Redirected build dir: outputs land in mobile/build, not android/app/build
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: Verify signature fingerprint (guards update continuity)
+        env:
+          EXPECTED_SHA256: 'C0:20:5E:95:FC:AA:56:DC:21:8B:8A:82:9B:6A:C5:3D:28:BD:C5:E4:55:89:B1:1D:22:18:81:A0:29:99:30:D7'
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          apk=mobile/build/app/outputs/flutter-apk/app-release.apk
+          [ -f "$apk" ] || { echo "::error::APK not found"; exit 1; }
+          tool=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -1)
+          got=$("$tool" verify --print-certs "$apk" \
+            | grep -i 'SHA-256 digest' | head -1 | awk '{print toupper($NF)}' \
+            | sed 's/../&:/g; s/:$//')
+          echo "built cert: $got"
+          if [ "$got" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Signing cert mismatch — refusing to publish an unupdateable APK"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$apk" "out/buzz-mobile-${TAG#mobile-v}-universal.apk"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ${{ needs.check.outputs.tag }}
+          prerelease: false
+          files: out/buzz-mobile-*.apk
+          body: |
+            Unofficial CI build of [block/buzz](https://github.com/block/buzz) mobile at upstream tag
+            [`${{ needs.check.outputs.tag }}`](https://github.com/block/buzz/releases/tag/${{ needs.check.outputs.tag }}) — not affiliated with Block.
+
+            - Universal APK, applicationId `xyz.block.buzz.mobile`
+            - Signing cert SHA-256: `C0:20:5E:95:FC:AA:56:DC:21:8B:8A:82:9B:6A:C5:3D:28:BD:C5:E4:55:89:B1:1D:22:18:81:A0:29:99:30:D7`
+            - Built with upstream's Hermit-pinned toolchain; compile-time default relay `wss://buzz.dirtydata.studio` (communities are configured in-app)
+
+            Install/update via [Obtainium](https://github.com/ImranR98/Obtainium): add `https://github.com/fredabood/buzz`.
