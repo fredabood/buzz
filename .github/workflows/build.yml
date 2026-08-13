@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: build
@@ -69,6 +70,34 @@ jobs:
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
           echo "tag=$latest" >> "$GITHUB_OUTPUT"
+
+      # Sunset watch: this repo exists only because upstream ships no Android
+      # APKs. When that changes — block/buzz#2845 closes, or any upstream
+      # release carries an .apk asset — open a discontinue notice (once) so
+      # the maintainer gets a GitHub notification to retire this repo.
+      - name: Watch for an official Android channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          official=false; reason=""
+          state=$(gh api repos/block/buzz/issues/2845 --jq .state 2>/dev/null || echo unknown)
+          if [ "$state" = "closed" ]; then
+            official=true; reason="block/buzz#2845 (publish mobile to a store) is closed"
+          elif gh api 'repos/block/buzz/releases?per_page=30' \
+              --jq '[.[].assets[].name | select(endswith(".apk"))] | length' | grep -qv '^0$'; then
+            official=true; reason="an upstream block/buzz release now carries an .apk asset"
+          fi
+          if [ "$official" = true ]; then
+            title="Upstream now ships an official Android channel — discontinue this repo"
+            if ! gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title" --json title --jq '.[].title' | grep -Fxq "$title"; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+                --body "Detected: $reason. Prefer official builds — switch requires uninstall/reinstall (different signing cert; chat data lives on the relays). Archive this repo once migrated."
+            fi
+            echo "::warning::$reason — official channel detected, see the discontinue issue"
+          else
+            echo "no official Android channel yet (#2845 $state, no upstream .apk assets)"
+          fi
 
   build:
     needs: check
